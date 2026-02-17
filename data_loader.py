@@ -3,159 +3,141 @@ import xarray as xr
 import torch
 import numpy as np
 
-def load_era5_data(data_dir, year=2000):
+def load_era5_data(data_dir, year=None):
     """
-    Loads ERA5 data from NetCDF files in the specified directory.
-    Finds files containing 't2m', 'swvl1', and 'z' (geopotential).
-    Merges them into a single dataset, crops to a 64x64 region, and normalizes.
+    Loads ERA5 data, crops to Thailand region IMMEDIATELY to save memory,
+    then merges and normalizes.
     """
     files = [f for f in os.listdir(data_dir) if f.endswith(".nc")]
-    
-    ds_list = []
-    found_vars = set()
+    files.sort() # Ensure time order
     
     print(f"Scanning {len(files)} files in {data_dir}...")
+    
+    # Thailand Region Bounds
+    # Lat: 5 to 21, Lon: 97 to 106
+    LAT_MIN, LAT_MAX = 5, 21
+    LON_MIN, LON_MAX = 97, 106
+    
+    processed_data_list = []
+    
+    # Global lat/lon arrays (to be captured from the first valid file)
+    final_lats = None
+    final_lons = None
     
     for f in files:
         path = os.path.join(data_dir, f)
         try:
+            # open_dataset with chunks={} to use dask (lazy loading) if possible, 
+            # but here we want to slice immediately.
             ds = xr.open_dataset(path)
-            # Standardize variable names if necessary (ERA5 sometimes uses different names)
-            # t2m, swvl1, z
             
-            # Check for variables
-            for var in ['t2m', 'swvl1', 'z']:
-                if var in ds.data_vars:
-                    found_vars.add(var)
-                    ds_list.append(ds)
-                    print(f"  Found {var} in {f}")
-        except Exception as e:
-            print(f"  Could not read {f}: {e}")
-
-    if not ds_list:
-        raise ValueError("No valid ERA5 NetCDF files found.")
-
-    # Merge datasets based on time and coordinates
-    # We might need to look out for 'expver' coordinate which indicates preliminary data in ERA5
-    try:
-        full_ds = xr.merge(ds_list)
-    except Exception as e:
-        print(f"Merge failed: {e}. Trying to dropping expver if present.")
-        # Sometimes expver causes issues. 
-        clean_ds_list = []
-        for ds in ds_list:
-            if 'expver' in ds.coords:
+            # 1. Drop unnecessary variables immediately
+            # Keep only: z, t2m, swvl1
+            vars_to_keep = [v for v in ['z', 't2m', 'swvl1'] if v in ds]
+            if not vars_to_keep:
+                continue
+            ds = ds[vars_to_keep]
+            
+            # 2. Handle 'expver' (ERA5T vs ERA5)
+            if 'expver' in ds.dims:
                 # Combine expver (take the one that is not NaN) usually ERA5T vs ERA5
-                # For simplicity, just drop it or select the first one
-                ds = ds.drop_vars('expver', errors='ignore')
-            clean_ds_list.append(ds)
-    # Merge all datasets
-    # compat='override' handles conflicting attrs/values by taking the first one
+                # Safer: combine_first or reduce
+                # print(f"  Collapsing expver dimension in {f}...")
+                ds = ds.reduce(np.nanmax, dim='expver')
+            elif 'expver' in ds.coords:
+                ds = ds.drop_vars('expver')
+                
+            # 3. Rename generic names if needed (not implementing here unless known)
+            
+            # 4. CROP SPATIALLY
+            # Determine slice direction for latitude
+            if ds.latitude[0] < ds.latitude[-1]:
+                lat_slice = slice(LAT_MIN, LAT_MAX)
+            else:
+                lat_slice = slice(LAT_MAX, LAT_MIN)
+                
+            ds_cropped = ds.sel(latitude=lat_slice, longitude=slice(LON_MIN, LON_MAX))
+            
+            # Check if empty (e.g. file covers different area)
+            if ds_cropped.latitude.size == 0 or ds_cropped.longitude.size == 0:
+                continue
+                
+            # 5. Load into memory (small chunk now!)
+            # We want to standardize dimensions to (Time, Lat, Lon)
+            # Ensure no extra dims like 'pressure_level'
+            if 'pressure_level' in ds_cropped.coords:
+                ds_cropped = ds_cropped.squeeze('pressure_level', drop=True)
+                
+            # Save coordinates from first file
+            if final_lats is None:
+                final_lats = ds_cropped.latitude.values
+                final_lons = ds_cropped.longitude.values
+                
+            # Verify coordinates match (simple check)
+            if ds_cropped.latitude.size != final_lats.size:
+                # Interpolate or skip? For now, skip if mismatch to avoid error
+                print(f"  Skipping {f} due to shape mismatch after crop.")
+                continue
+            
+            # Ensure all required vars exist, fill with 0 if missing (e.g. swvl1 might be in separate file)
+            # This is tricky if files are split by variable. 
+            # If files are split by variable (e.g. z_2000.nc, t2m_2000.nc), we CANNOT crop and append yet.
+            # We must merge by TIME first.
+            
+            # Assumption based on error logs: "Found z in era5_upper... Found t2m in ..."
+            # It seems files are split by VARIABLE and YEAR. 
+            # Merging by variable first, then cropping is memory intensive.
+            # We should crop EACH variable file, then merge.
+            
+            processed_data_list.append(ds_cropped)
+            print(f"  Loaded & Cropped: {f} {ds_cropped.dims}")
+            
+        except Exception as e:
+            print(f"  Error processing {f}: {e}")
+            continue
+
+    if not processed_data_list:
+        raise ValueError("No data loaded successfully.")
+
+    print("Merging cropped datasets...")
+    # Now merge the SMALL cropped datasets
+    # compat='override' is safe now because they should be same grid
     try:
-        full_ds = xr.merge(clean_ds_list, compat='override')
+        full_ds = xr.merge(processed_data_list, compat='override', join='outer')
     except Exception as e:
         print(f"Merge failed: {e}")
-        # Fallback: try to just use the first file that has everything?
-        # Or just raise
         raise e
 
-    print("merged dataset:\n", full_ds)
+    print(f"Merged Data Shape: {full_ds.dims}")
     
-    # Select variables
-    req_vars = ['z', 't2m', 'swvl1']
-    for v in req_vars:
-        if v not in full_ds:
-            print(f"Warning: Variable {v} missing in dataset!")
-            # Filling with zeros for prototype if missing (strictly for testing pipeline)
-            full_ds[v] = xr.full_like(full_ds[list(full_ds.data_vars)[0]], 0)
+    # Check for missing variables and fill
+    for var in ['z', 't2m', 'swvl1']:
+        if var not in full_ds:
+             print(f"  Warning: {var} missing, filling with zeros")
+             full_ds[var] = (('valid_time', 'latitude', 'longitude'), np.zeros((full_ds.dims['valid_time'], len(final_lats), len(final_lons))))
 
-    # Crop to 64x64 spatial region to fit the model architecture
-    # The inspected data was huge (813x105). 
-    # Let's take a center crop or just the first 64x64.
+    # Interpolate NaNs over time
+    # full_ds = full_ds.interpolate_na(dim='valid_time', method='linear', fill_value="extrapolate")
     
-    lat_size = full_ds.dims['latitude']
-    lon_size = full_ds.dims['longitude']
-    
-    # Crop to Thailand Region (Lat 5-21, Lon 97-106)
-    # The downloaded data might be broader than expected.
-    # We use .sel(method='nearest') or slice to get the correct area.
-    # Note: ERA5 latitudes are often descending (90 to -90), so slice might need (21, 5).
-    
-    print("Cropping to Thailand region (Lat: 21-5, Lon: 97-106)...")
-    try:
-        # Check if we need to sort or handle descending coords
-        if full_ds.latitude[0] < full_ds.latitude[-1]:
-            lat_slice = slice(5, 21)
-        else:
-            lat_slice = slice(21, 5) # Descending
-            
-        full_ds = full_ds.sel(latitude=lat_slice, longitude=slice(97, 106))
-        
-        # Ensure we have a consistent size (64x64) for the model?
-        # If the selected region is smaller/larger, we might need to resize or pad.
-        # 21-5 = 16 deg. 16/0.25 = 64 points.
-        # 106-97 = 9 deg. 9/0.25 = 36 points.
-        
-        # We need 64x64 for the current model architecture.
-        # Let's pad or resize if needed, OR just take a 64x64 chunks starting from there.
-        # Actually, let's just resize/interpolate to 64x64 or change model input size effectively?
-        # The model is ConvLSTM, it can handle variable sizes if fully convolutional?
-        # No, the linear layers or flat/init_hidden might depend on size.
-        # The provided model `heatwave_model.py` uses `init_hidden` which takes `image_size`.
-        # So it SHOULD be flexible.
-        
-    except Exception as e:
-        print(f"Cropping failed: {e}. Fallback to index slicing.")
-        full_ds = full_ds.isel(latitude=slice(0, 64), longitude=slice(0, 64))
-
-    print(f"Cropped dataset dimensions: {full_ds.dims}")
-
-    # Convert to Numpy and Normalize
-    # We need (Time, Channels, Height, Width)
-    # Channels: z, t2m, swvl1
-    
+    # Normalize
     z = full_ds['z'].values
     t2m = full_ds['t2m'].values
     swvl1 = full_ds['swvl1'].values
     
-    print(f"Shapes before processing: Z={z.shape}, T2M={t2m.shape}, SWVL1={swvl1.shape}")
-
-    # Squeeze Z if it has an extra dimension (pressure levels)
-    if z.ndim == 4 and z.shape[1] == 1:
-        z = z.squeeze(axis=1)
-        print(f"Squeezed Z shape: {z.shape}")
-        
-    # Ensure all have same shape
-    if z.shape != t2m.shape:
-        print("Shape mismatch detected! Attempting to trim/broadcast.")
-        # If time dimension differs slightly
-        min_time = min(z.shape[0], t2m.shape[0], swvl1.shape[0])
-        z = z[:min_time]
-        t2m = t2m[:min_time]
-        swvl1 = swvl1[:min_time]
-    
-    # Handle NaN values
+    # Handle NaNs (from join='outer' or missing data)
     z = np.nan_to_num(z)
     t2m = np.nan_to_num(t2m)
     swvl1 = np.nan_to_num(swvl1)
-
-    # Stack into (Time, Channels, H, W)
-    # shapes are (Time, H, W)
-    data = np.stack([z, t2m, swvl1], axis=1) # Axis 1 becomes channels
     
-    # Normalize (Standard Scaling)
+    # Stack: (Time, Channels, H, W)
+    data = np.stack([z, t2m, swvl1], axis=1)
+    
+    # Normalize
     mean = data.mean(axis=(0, 2, 3), keepdims=True)
     std = data.std(axis=(0, 2, 3), keepdims=True)
-    
     data_norm = (data - mean) / (std + 1e-6)
     
-    print(f"Final Data Shape: {data_norm.shape}")
-    
-    # Return coordinates and scaler statistics for API/Mapping
-    lats = full_ds['latitude'].values
-    lons = full_ds['longitude'].values
-    
-    return data_norm, lats, lons, mean, std
+    return data_norm, full_ds['latitude'].values, full_ds['longitude'].values, mean, std
 
 def create_sequences(data, seq_len=5, future_seq=2):
     """
